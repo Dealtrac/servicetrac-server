@@ -1,106 +1,131 @@
 const express = require('express');
 const twilio = require('twilio');
+const cors = require('cors');
+
 const app = express();
-
-// ── CORS — allow requests from any origin (local HTML files, etc.)
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
-
+app.use(cors());
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: true }));
 
-const callJobs = {};
+// ── In-memory call queue ──────────────────────────────
+let callQueue = [];
+let callResults = {};
 
-// ── Health check — open in browser to confirm server is running
-app.get('/', (req, res) => {
+// ── Health check ──────────────────────────────────────
+app.get('/status', (req, res) => {
   res.json({
-    status: 'ServiceTrac AI Call Server running ✓',
-    version: '2.0',
-    time: new Date().toISOString(),
-    endpoints: ['GET /', 'POST /call-test', 'POST /call-result', 'GET /status', 'GET /ping']
+    status: 'ok',
+    service: 'ServiceTrac AI - VM Detection Server',
+    queued: callQueue.length,
+    results: Object.keys(callResults).length,
+    time: new Date().toISOString()
   });
 });
 
-// ── Simple ping — used by app to test connection (no Twilio needed)
-app.get('/ping', (req, res) => {
-  res.json({ ok: true, message: 'ServiceTrac server reachable' });
+// ── Queue a call ──────────────────────────────────────
+app.post('/queue', (req, res) => {
+  const { phone, businessName, accountSid, authToken, fromNumber } = req.body;
+  if (!phone || !accountSid || !authToken || !fromNumber) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  const id = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+  callQueue.push({ id, phone, businessName, accountSid, authToken, fromNumber, queuedAt: new Date().toISOString() });
+  res.json({ success: true, id, queued: callQueue.length });
 });
 
-// ── Queue a call test
-app.post('/call-test', async (req, res) => {
-  const { to, sid, token, from, leadId, ghlContactId } = req.body;
-
-  // If no Twilio creds provided, return success for connection test
-  if (!sid || !token) {
-    return res.json({ success: true, test: true, message: 'Connection OK — provide Twilio credentials to make real calls' });
+// ── Fire all queued calls ─────────────────────────────
+app.post('/fire', async (req, res) => {
+  if (callQueue.length === 0) {
+    return res.json({ success: true, fired: 0, message: 'No calls in queue' });
   }
+  const fired = [];
+  const serverUrl = process.env.RAILWAY_STATIC_URL
+    ? `https://${process.env.RAILWAY_STATIC_URL}`
+    : req.protocol + '://' + req.get('host');
 
-  if (!to || !from) {
-    return res.status(400).json({ error: 'Missing: to, from' });
+  for (const item of callQueue) {
+    try {
+      const client = twilio(item.accountSid, item.authToken);
+      const call = await client.calls.create({
+        to: item.phone,
+        from: item.fromNumber,
+        url: `${serverUrl}/twiml`,
+        statusCallback: `${serverUrl}/result/${item.id}`,
+        statusCallbackMethod: 'POST',
+        statusCallbackEvent: ['completed'],
+        machineDetection: 'Enable',
+        asyncAmd: 'true',
+        asyncAmdStatusCallback: `${serverUrl}/amd/${item.id}`,
+        asyncAmdStatusCallbackMethod: 'POST',
+        timeout: 20
+      });
+      callResults[item.id] = { status: 'calling', callSid: call.sid, businessName: item.businessName, phone: item.phone };
+      fired.push({ id: item.id, businessName: item.businessName, callSid: call.sid });
+    } catch (err) {
+      callResults[item.id] = { status: 'error', error: err.message, businessName: item.businessName };
+      fired.push({ id: item.id, businessName: item.businessName, error: err.message });
+    }
   }
-
-  const digits = to.replace(/\D/g, '');
-  const e164 = digits.length === 10 ? '+1' + digits : '+' + digits;
-
-  try {
-    const client = twilio(sid, token);
-    const serverUrl = process.env.SERVER_URL || `https://${req.headers.host}`;
-
-    const call = await client.calls.create({
-      to: e164,
-      from: from,
-      twiml: '<Response><Pause length="30"/></Response>',
-      machineDetection: 'DetectMessageEnd',
-      asyncAmd: true,
-      asyncAmdStatusCallback: `${serverUrl}/call-result`,
-      asyncAmdStatusCallbackMethod: 'POST',
-    });
-
-    callJobs[call.sid] = {
-      leadId,
-      ghlContactId,
-      phone: e164,
-      startTime: new Date().toISOString()
-    };
-
-    console.log(`✓ Call queued: ${e164} | Lead: ${leadId} | Sid: ${call.sid}`);
-    res.json({ success: true, callSid: call.sid, to: e164 });
-
-  } catch (err) {
-    console.error('Twilio error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+  callQueue = [];
+  res.json({ success: true, fired: fired.length, results: fired });
 });
 
-// ── Twilio callback when call finishes
-app.post('/call-result', (req, res) => {
-  const { CallSid, AnsweredBy, To } = req.body;
-  const job = callJobs[CallSid];
-  const isVM       = AnsweredBy && AnsweredBy.startsWith('machine');
-  const isAnswered = AnsweredBy === 'human';
-  const result     = isVM ? 'VOICEMAIL' : isAnswered ? 'ANSWERED' : 'UNKNOWN';
-  console.log(`Call result: ${To} → ${result} (${AnsweredBy}) | Lead: ${job?.leadId}`);
-  if (job) delete callJobs[CallSid];
+// ── TwiML — what plays when answered ─────────────────
+app.all('/twiml', (req, res) => {
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Pause length="1"/>
+  <Hangup/>
+</Response>`);
+});
+
+// ── AMD result (voicemail detection) ─────────────────
+app.post('/amd/:id', (req, res) => {
+  const { id } = req.params;
+  const { AnsweredBy } = req.body;
+  if (callResults[id]) {
+    callResults[id].answeredBy = AnsweredBy;
+    callResults[id].voicemail = AnsweredBy === 'machine_start' || AnsweredBy === 'machine_end_beep' || AnsweredBy === 'machine_end_silence' || AnsweredBy === 'machine_end_other';
+  }
   res.sendStatus(200);
 });
 
-// ── See all pending calls
-app.get('/status', (req, res) => {
-  res.json({
-    pendingCalls: Object.keys(callJobs).length,
-    calls: Object.entries(callJobs).map(([sid, job]) => ({
-      callSid: sid,
-      leadId: job.leadId,
-      phone: job.phone,
-      startTime: job.startTime
-    }))
-  });
+// ── Call completed callback ───────────────────────────
+app.post('/result/:id', (req, res) => {
+  const { id } = req.params;
+  const { CallStatus, AnsweredBy, CallDuration } = req.body;
+  if (callResults[id]) {
+    callResults[id].callStatus = CallStatus;
+    callResults[id].duration = CallDuration;
+    if (AnsweredBy) {
+      callResults[id].answeredBy = AnsweredBy;
+      callResults[id].voicemail = AnsweredBy === 'machine_start' || AnsweredBy === 'machine_end_beep' || AnsweredBy === 'machine_end_silence' || AnsweredBy === 'machine_end_other';
+    }
+    callResults[id].completedAt = new Date().toISOString();
+  }
+  res.sendStatus(200);
+});
+
+// ── Get results ───────────────────────────────────────
+app.get('/results', (req, res) => {
+  res.json({ results: callResults, count: Object.keys(callResults).length });
+});
+
+app.get('/results/:id', (req, res) => {
+  const result = callResults[req.params.id];
+  if (!result) return res.status(404).json({ error: 'Not found' });
+  res.json(result);
+});
+
+// ── Clear results ─────────────────────────────────────
+app.post('/clear', (req, res) => {
+  callQueue = [];
+  callResults = {};
+  res.json({ success: true, message: 'Queue and results cleared' });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ServiceTrac AI server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`ServiceTrac AI VM Detection Server running on port ${PORT}`);
+});
